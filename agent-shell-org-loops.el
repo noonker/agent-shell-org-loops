@@ -124,7 +124,16 @@ one of the following forms so the org buffer state can be updated:
   STATE: DONE       -- the task is complete
   STATE: NEEDINFO   -- you need clarification from the user
 If you need to run a tool that requires permission, request it normally;
-the user will receive a permission prompt inside their org buffer."
+the user will receive a permission prompt inside their org buffer.
+To propose subtasks the user may want to run separately, include one
+or more blocks of the following form anywhere in your reply:
+  #+begin_src loops-task
+  <one-line title>
+  <optional body lines describing what should be done>
+  #+end_src
+Each block becomes a TODO child heading under your reply; the user
+decides whether to promote it to READY.  Do not use this for work you
+are performing yourself in this turn."
   "Preamble prepended to the first prompt of every new shell."
   :type 'string)
 
@@ -355,7 +364,7 @@ Searches every LOOPS buffer; the heading may have been refiled."
 
 (defun agent-shell-org-loops--replace-placeholder (uuid response)
   "Replace the placeholder for UUID with RESPONSE text.
-Returns the parent origin heading marker, or nil if placeholder was gone."
+Returns (cons ORIGIN-MK REPLY-MK) or nil if placeholder was gone."
   (when-let ((loc (agent-shell-org-loops--find-placeholder uuid)))
     (with-current-buffer (car loc)
       (save-excursion
@@ -372,11 +381,11 @@ Returns the parent origin heading marker, or nil if placeholder was gone."
                   (string-trim response) "\n")
           (save-excursion
             (goto-char reply-start)
-            (agent-shell-org-loops--add-sent-tag)))
-        (org-back-to-heading t)
-        ;; Return a marker to the ORIGIN heading (parent of this reply).
-        (when (org-up-heading-safe)
-          (point-marker))))))
+            (agent-shell-org-loops--add-sent-tag))
+          (let ((reply-mk (copy-marker reply-start)))
+            (goto-char reply-start)
+            (when (org-up-heading-safe)
+              (cons (point-marker) reply-mk))))))))
 
 ;;;; Shell session registry
 
@@ -491,20 +500,82 @@ otherwise falls back to the per-heading :AGENT_SHELL_BUFFER: property."
 
 ;;;; Turn completion
 
+(defun agent-shell-org-loops--parse-task-blocks (text)
+  "Extract `loops-task' src blocks from TEXT.
+Returns (cons CLEANED-TEXT TASKS): CLEANED-TEXT has the blocks removed;
+TASKS is a list of plists with :title and :body.  Within a block, the
+first non-empty line is the title and the rest is the body."
+  (let ((tasks nil))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (let ((case-fold-search t))
+        (while (re-search-forward
+                "^#\\+begin_src[ \t]+loops-task[^\n]*\n" nil t)
+          (let ((open-start (match-beginning 0))
+                (body-start (match-end 0)))
+            (when (re-search-forward "^#\\+end_src[ \t]*$" nil t)
+              (let* ((body-end (match-beginning 0))
+                     (close-end (match-end 0))
+                     (block-body (buffer-substring-no-properties
+                                  body-start body-end))
+                     (lines (split-string block-body "\n"))
+                     (non-empty (seq-drop-while
+                                 (lambda (l) (string-empty-p (string-trim l)))
+                                 lines))
+                     (title (string-trim
+                             (or (car non-empty) "(untitled task)")))
+                     (body (string-trim-right
+                            (mapconcat #'identity (cdr non-empty) "\n"))))
+                (push (list :title title :body body) tasks)
+                (delete-region open-start
+                               (min (point-max) (1+ close-end))))))))
+      (cons (string-trim (buffer-string)) (nreverse tasks)))))
+
+(defun agent-shell-org-loops--materialize-tasks (reply-mk tasks)
+  "Insert each of TASKS as a child TODO heading under REPLY-MK."
+  (when (and tasks (markerp reply-mk) (buffer-live-p (marker-buffer reply-mk)))
+    (with-current-buffer (marker-buffer reply-mk)
+      (save-excursion
+        (goto-char reply-mk)
+        (org-back-to-heading t)
+        (let ((level (org-current-level)))
+          (org-end-of-subtree t t)
+          (unless (bolp) (insert "\n"))
+          (dolist (task tasks)
+            (let ((title (plist-get task :title))
+                  (body (plist-get task :body)))
+              (insert (make-string (1+ level) ?*) " TODO " title "\n")
+              (unless (string-empty-p body)
+                (insert body "\n")))))))))
+
 (defun agent-shell-org-loops--on-turn-complete (shell-buffer)
   "Handle turn-complete for SHELL-BUFFER: write reply back and update state."
   (when-let* ((turn (agent-shell-org-loops--pop-turn shell-buffer))
               (uuid (plist-get turn :uuid)))
     (let* ((raw (or (plist-get turn :accum) ""))
-           (clean (agent-shell-org-loops--strip-state-marker raw))
-           (parsed-state (car clean))
-           (body (cdr clean))
-           (body (if (string-empty-p (string-trim body))
-                     "(no message body — agent may have only run tools)"
-                   (agent-shell-org-loops--markdown-to-org body)))
-           (origin-mk (agent-shell-org-loops--replace-placeholder uuid body)))
+           (state-split (agent-shell-org-loops--strip-state-marker raw))
+           (parsed-state (car state-split))
+           (task-split (agent-shell-org-loops--parse-task-blocks
+                        (cdr state-split)))
+           (tasks (cdr task-split))
+           (body (car task-split))
+           (body (cond
+                  ((not (string-empty-p (string-trim body)))
+                   (agent-shell-org-loops--markdown-to-org body))
+                  (tasks
+                   (format "(spawned %d subtask%s)"
+                           (length tasks)
+                           (if (= 1 (length tasks)) "" "s")))
+                  (t
+                   "(no message body — agent may have only run tools)")))
+           (markers (agent-shell-org-loops--replace-placeholder uuid body))
+           (origin-mk (car markers))
+           (reply-mk (cdr markers)))
       (dolist (mk (plist-get turn :sent-markers))
         (agent-shell-org-loops--tag-marker-sent mk))
+      (when reply-mk
+        (agent-shell-org-loops--materialize-tasks reply-mk tasks))
       (cond
        ((null origin-mk)
         (message "agent-shell-org-loops: reply for %s dropped (origin buffer gone)"

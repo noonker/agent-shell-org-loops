@@ -164,6 +164,39 @@ run: rm -rf build/
 
 Once resolved, the heading flips back to =INPROGRESS= and the agent continues.
 
+* Agent-spawned subtasks
+
+The agent can propose follow-up work by embedding one or more blocks in
+its reply:
+
+#+begin_src org
+,#+begin_src loops-task
+Investigate UTF-16 handling in the tokenizer
+Check src/tokenize.py:145 — surrogate pair path looks wrong.
+Also verify src/decode.py handles BOMs.
+,#+end_src
+#+end_src
+
+Each block gets stripped from the finalized reply and materialized as a
+=TODO= child heading under it:
+
+#+begin_src org
+,** Reply [2026-08-25 Tue 10:00]                       :done:
+Reply body without the loops-task block.
+,*** TODO Investigate UTF-16 handling in the tokenizer
+Check src/tokenize.py:145 — surrogate pair path looks wrong.
+Also verify src/decode.py handles BOMs.
+#+end_src
+
+Nothing auto-runs. Review the proposed tasks and flip whichever you
+want to =READY= — each becomes its own origin with its own shell (or
+queues on the shared shell). Because the tasks are nested under the
+tagged =Reply=, they don't leak back into the parent's follow-up
+prompts.
+
+The block format: first non-empty line is the task title, remaining
+lines are the body.
+
 * Per-heading overrides
 
 Put these in the heading's own property drawer:
