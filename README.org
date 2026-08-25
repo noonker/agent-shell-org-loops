@@ -1,0 +1,177 @@
+#+TITLE: agent-shell-org-loops
+#+OPTIONS: toc:nil num:nil
+
+Drive [[https://github.com/xenodium/agent-shell][agent-shell]] sessions from org-mode TODO transitions. Flip a heading to
+=READY= and the plugin hands its subtree to an agent, then writes the reply
+back as a child heading. Tool-permission prompts surface as inline babel
+blocks you can approve with =C-c C-c=.
+
+* Install
+
+Both packages need to be on your ~load-path~.
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "~/git/agent-shell/")
+(add-to-list 'load-path "~/git/agent-shell-org-loops/")
+
+(require 'agent-shell-anthropic)  ;; or whichever provider you use
+(require 'agent-shell-org-loops)
+
+(global-agent-shell-org-loops-mode 1)
+#+end_src
+
+Configure agent-shell's authentication normally (see its README). This plugin
+just drives it.
+
+* Enable a file
+
+Add a keyword at the top of any org file:
+
+#+begin_src org
+,#+LOOPS: true
+,#+LOOPS_PROJECT: ~/code/my-project   ;; optional: default cwd for shells
+,#+LOOPS_AGENT: claude-code            ;; optional: agent id, default claude-code
+,#+LOOPS_SHARED_SHELL: t               ;; optional: one shell for the whole file
+#+end_src
+
+With =LOOPS_SHARED_SHELL= off (default), every heading spawns its own shell.
+With it on, all headings in the file share one shell — turns queue behind
+each other automatically.
+
+Opening the file (or toggling ~agent-shell-org-loops-mode~) arms the buffer.
+
+* Basic usage
+
+Write a heading, then flip it to =READY=:
+
+#+begin_src org
+,* READY Refactor the parser to handle unicode input
+The current tokenizer chokes on multi-byte characters. Take a look at
+~src/tokenize.py~ and propose a fix.
+#+end_src
+
+What happens:
+
+1. A background =*Claude*= buffer is started. Its name is stored in a
+   drawer under the heading:
+   #+begin_src org
+   :PROPERTIES:
+   :AGENT_SHELL_BUFFER: *Claude* <my-project>
+   :AGENT_PENDING: 8f3a-...
+   :END:
+   #+end_src
+2. A placeholder child heading appears:
+   #+begin_src org
+   ,** Reply <<agent-shell-pending:8f3a-...>>
+   [agent-shell working... 8f3a-...]
+   #+end_src
+3. When the agent finishes, the placeholder is rewritten to
+   =** Reply [2026-08-24 Mon 14:22]= with the response body.
+4. The parent heading's state is updated based on a trailing =STATE:=
+   marker the agent emits.
+
+Next turn: edit the heading (or add follow-up notes under it), flip it
+back to =READY=, and it reuses the same shell.
+
+* State machine
+
+| State        | Set by | Meaning                                    |
+|--------------+--------+--------------------------------------------|
+| =TODO=       | you    | authored, not yet handed off               |
+| =READY=      | you    | pick this up (fires a turn)                |
+| =PERMISSION= | plugin | agent is blocked on a permission decision  |
+| =NEEDINFO=   | agent  | turn finished; agent wants clarification   |
+| =DONE=       | agent  | turn finished; agent considers work done   |
+| =CANCELLED=  | you    | abort the in-flight turn                   |
+
+Tag =:noloop:= on a heading opts it out even in =READY=.
+
+Make sure your org todo keywords list includes these, e.g.:
+
+#+begin_src emacs-lisp
+(setq org-todo-keywords
+      '((sequence "TODO" "READY" "PERMISSION" "NEEDINFO"
+                  "|" "DONE" "CANCELLED")))
+#+end_src
+
+* Permission requests
+
+When the agent asks to run a tool that needs permission, the heading flips
+to =PERMISSION= and a block is inserted under it:
+
+#+begin_src org
+,** Permission request <<agent-shell-permission:c1d2-...>>
+run: rm -rf build/
+
+,#+begin_src agent-shell-permission :id c1d2-...
+run: rm -rf build/
+,#+end_src
+#+end_src
+
+- =C-c C-c= inside the block approves the request.
+- =M-x agent-shell-org-loops-deny-permission-at-point= rejects it.
+- Or use agent-shell's own prompt in the shell buffer — either path
+  updates the org block with a =#+RESULTS:= line noting the decision.
+
+Once resolved, the heading flips back to =READY= and the agent continues.
+
+* Per-heading overrides
+
+Put these in the heading's own property drawer:
+
+- =:LOOPS_PROJECT:= — override the working directory for this heading only
+- =:LOOPS_AGENT:= — override the agent config for this heading only
+
+* Capture
+
+Org-capture templates that land a =READY= heading in a LOOPS-enabled file
+trigger automatically on finalize. No extra setup.
+
+* Batch trigger
+
+Two commands run a whole group of headings at once. Combined with
+=LOOPS_SHARED_SHELL: t= they queue behind each other on a single shell.
+
+- =M-x agent-shell-org-loops-run-all-ready-in-buffer= — every =READY=
+  heading in the current file.
+- =M-x agent-shell-org-loops-run-all-ready-in-subtree= — every =READY=
+  heading under the subtree at point.
+
+Headings tagged =:noloop:= are skipped.
+
+* Dashboard
+
+=M-x agent-shell-org-loops-list= opens a =tabulated-list= buffer showing
+every in-flight turn and pending permission across every LOOPS file:
+
+: Kind        Heading                    File          Elapsed   Shell
+: turn        Refactor parser            plan.org      00:03:12  *Claude*<my-project>
+: permission  rm -rf build/              plan.org      -         *Claude*<my-project>
+
+- =RET= jumps to the origin heading.
+- =g= refreshes.
+
+* Notifications
+
+When a turn finishes and its origin buffer isn't visible in any window,
+the plugin fires a desktop notification via =notifications-notify= (dbus),
+falling back to =alert= or a plain =message=. Disable with:
+
+#+begin_src emacs-lisp
+(setq agent-shell-org-loops-notify-on-complete nil)
+#+end_src
+
+* Reply markdown
+
+The agent replies in markdown. Fenced code blocks (~```lang~ … ~```~) are
+rewritten as =#+begin_src lang= / =#+end_src= before being inserted, so
+they syntax-highlight and behave like normal org source blocks.
+
+* Crash recovery
+
+If Emacs (or the agent) dies mid-turn, the file is left with an
+=:AGENT_PENDING:= property and a stranded =Reply <<agent-shell-pending:…>>=
+placeholder. When the file is next opened (or the mode is re-enabled), any
+placeholder whose shell buffer is dead is rewritten to
+=Reply (abandoned — shell died)= and its =:AGENT_PENDING:= property is
+cleared.
