@@ -8,7 +8,40 @@ blocks you can approve with =C-c C-c=.
 
 * Install
 
-Both packages need to be on your ~load-path~.
+Neither this package nor ~agent-shell~ is on MELPA yet, so install both from
+their git repos.
+
+** straight.el
+
+#+begin_src emacs-lisp
+(straight-use-package
+ '(agent-shell :type git :host github :repo "xenodium/agent-shell"))
+(straight-use-package
+ '(agent-shell-org-loops :type git :host github
+                         :repo "noonker/agent-shell-org-loops"))
+
+(require 'agent-shell-anthropic)  ;; or whichever provider you use
+(require 'agent-shell-org-loops)
+(global-agent-shell-org-loops-mode 1)
+#+end_src
+
+With ~use-package~ + straight:
+
+#+begin_src emacs-lisp
+(use-package agent-shell
+  :straight (:type git :host github :repo "xenodium/agent-shell"))
+
+(use-package agent-shell-org-loops
+  :straight (:type git :host github :repo "noonker/agent-shell-org-loops")
+  :after agent-shell
+  :config
+  (require 'agent-shell-anthropic)
+  (global-agent-shell-org-loops-mode 1))
+#+end_src
+
+** Manual
+
+Clone both repos and put them on your ~load-path~:
 
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/git/agent-shell/")
@@ -16,7 +49,6 @@ Both packages need to be on your ~load-path~.
 
 (require 'agent-shell-anthropic)  ;; or whichever provider you use
 (require 'agent-shell-org-loops)
-
 (global-agent-shell-org-loops-mode 1)
 #+end_src
 
