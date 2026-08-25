@@ -731,8 +731,9 @@ than `turn-complete', so our own queue would otherwise drift."
 (defun agent-shell-org-loops--after-capture-finalize ()
   "If the just-finalized capture landed as READY in a LOOPS buffer, trigger."
   (unless org-note-abort
-    (when-let* ((pos (org-capture-get :position))
-                (buf (and (markerp pos) (marker-buffer pos))))
+    (when-let* ((buf (org-capture-get :buffer))
+                (pos (org-capture-get :insertion-point))
+                ((buffer-live-p buf)))
       (with-current-buffer buf
         (when (agent-shell-org-loops--loops-enabled-p)
           (save-excursion
