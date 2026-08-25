@@ -111,6 +111,7 @@ back to =READY=, and it reuses the same shell.
 |--------------+--------+--------------------------------------------|
 | =TODO=       | you    | authored, not yet handed off               |
 | =READY=      | you    | pick this up (fires a turn)                |
+| =INPROGRESS= | plugin | turn is in flight                          |
 | =PERMISSION= | plugin | agent is blocked on a permission decision  |
 | =NEEDINFO=   | agent  | turn finished; agent wants clarification   |
 | =DONE=       | agent  | turn finished; agent considers work done   |
@@ -122,7 +123,7 @@ Make sure your org todo keywords list includes these, e.g.:
 
 #+begin_src emacs-lisp
 (setq org-todo-keywords
-      '((sequence "TODO" "READY" "PERMISSION" "NEEDINFO"
+      '((sequence "TODO" "READY" "INPROGRESS" "PERMISSION" "NEEDINFO"
                   "|" "DONE" "CANCELLED")))
 #+end_src
 
@@ -145,7 +146,7 @@ run: rm -rf build/
 - Or use agent-shell's own prompt in the shell buffer — either path
   updates the org block with a =#+RESULTS:= line noting the decision.
 
-Once resolved, the heading flips back to =READY= and the agent continues.
+Once resolved, the heading flips back to =INPROGRESS= and the agent continues.
 
 * Per-heading overrides
 

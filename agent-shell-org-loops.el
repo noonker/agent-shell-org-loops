@@ -17,6 +17,7 @@
 ;; State machine expected on the org side:
 ;;   TODO       -- authored but not yet handed to the agent
 ;;   READY      -- picked up by the agent (triggers a turn)
+;;   INPROGRESS -- turn is in flight (set automatically after READY fires)
 ;;   PERMISSION -- agent is blocked awaiting a permission decision
 ;;   NEEDINFO   -- agent finished a turn asking for clarification
 ;;   DONE       -- agent finished a turn and considers work complete
@@ -70,6 +71,12 @@
 
 (defcustom agent-shell-org-loops-trigger-state "READY"
   "Todo keyword that hands a heading off to the agent."
+  :type 'string)
+
+(defcustom agent-shell-org-loops-inprogress-state "INPROGRESS"
+  "Todo keyword set on a heading while its turn is in flight.
+Applied automatically after the trigger state fires, and re-applied
+after a permission response resumes the turn."
   :type 'string)
 
 (defcustom agent-shell-org-loops-terminal-states
@@ -543,7 +550,9 @@ cancel it first")
         (agent-shell-org-loops--insert-placeholder uuid)
         (agent-shell-org-loops--enqueue-turn
          shell (list :uuid uuid :origin origin-mk :accum ""))
-        (agent-shell-org-loops--send-or-queue shell prompt)))))
+        (agent-shell-org-loops--send-or-queue shell prompt)
+        (agent-shell-org-loops--set-todo-silently
+         agent-shell-org-loops-inprogress-state)))))
 
 (defun agent-shell-org-loops--has-reply-child-p ()
   "Return non-nil when the heading at point already has a Reply child."
@@ -743,9 +752,8 @@ Handles both org-block acceptance and shell-buffer acceptance uniformly."
         (with-current-buffer (marker-buffer origin-mk)
           (save-excursion
             (goto-char origin-mk)
-            ;; Agent will resume its turn; heading reads as "working" again.
             (agent-shell-org-loops--set-todo-silently
-             agent-shell-org-loops-trigger-state)))))))
+             agent-shell-org-loops-inprogress-state)))))))
 
 (defun agent-shell-org-loops--mark-permission-resolved (origin-mk uuid decision)
   "Append a RESULTS line to the permission block for UUID under ORIGIN-MK."
