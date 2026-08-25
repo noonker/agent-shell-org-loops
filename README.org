@@ -102,8 +102,24 @@ What happens:
 4. The parent heading's state is updated based on a trailing =STATE:=
    marker the agent emits.
 
-Next turn: edit the heading (or add follow-up notes under it), flip it
-back to =READY=, and it reuses the same shell.
+Next turn: add a child heading with whatever follow-up content you like
+and flip the parent back to =READY=. The plugin only sends children that
+lack the =:done:= tag, so past =Reply= / =Permission request= headings
+(which are auto-tagged) are skipped, and the origin body isn't re-fed
+either. Everything that gets sent picks up the =:done:= tag once the
+turn completes successfully — cancelled or crashed turns leave the
+content untouched so a retry re-sends it.
+
+#+begin_src org
+,* READY Refactor the parser to handle unicode input   :done:
+The current tokenizer chokes on multi-byte characters...
+,** Reply [2026-08-24 Mon 14:22]                       :done:
+Here's a patch...
+,** Also please add a regression test for surrogate pairs.
+#+end_src
+
+Flip the parent to =READY= and only the third child ("Also please...")
+is sent on the next turn.
 
 * State machine
 

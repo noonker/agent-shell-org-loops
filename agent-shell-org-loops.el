@@ -23,6 +23,14 @@
 ;;   DONE       -- agent finished a turn and considers work complete
 ;;   CANCELLED  -- user aborted; running turn (if any) gets interrupted
 ;;
+;; Follow-up prompts are built from the origin body + any direct-child
+;; subtrees whose heading does NOT carry the `:done:' tag (customizable
+;; via `agent-shell-org-loops-sent-tag').  Once a turn completes, the
+;; origin and every sent child get tagged; Reply and Permission-request
+;; headings are tagged at creation.  To send a follow-up, add a child
+;; heading with whatever content you like — it'll be picked up on the
+;; next READY transition and tagged after the turn completes.
+;;
 ;; File-level keywords honored:
 ;;   #+LOOPS: true              -- enable this file
 ;;   #+LOOPS_PROJECT: /some/dir -- default `default-directory' for shells
@@ -77,6 +85,16 @@
   "Todo keyword set on a heading while its turn is in flight.
 Applied automatically after the trigger state fires, and re-applied
 after a permission response resumes the turn."
+  :type 'string)
+
+(defcustom agent-shell-org-loops-sent-tag "done"
+  "Org tag applied to headings whose content has been sent to the agent.
+On every turn, only the origin body and direct-child subtrees lacking
+this tag are included in the prompt.  Agent-generated Reply and
+Permission-request children are tagged at creation so they aren't
+re-fed.  The origin heading and any user-added children are tagged
+after the turn completes successfully — so a cancelled or crashed turn
+leaves their content available for the next attempt."
   :type 'string)
 
 (defcustom agent-shell-org-loops-terminal-states
@@ -187,6 +205,25 @@ Falls back to the file-level `#+LOOPS_PROJECT:', then `default-directory'."
              agent-id))
     (funcall ctor)))
 
+;;;; Sent-tag bookkeeping
+
+(defun agent-shell-org-loops--heading-sent-p ()
+  "Return non-nil when the heading at point carries the sent tag."
+  (member agent-shell-org-loops-sent-tag (org-get-tags nil t)))
+
+(defun agent-shell-org-loops--add-sent-tag ()
+  "Add the sent tag to the heading at point (idempotent)."
+  (org-toggle-tag agent-shell-org-loops-sent-tag 'on))
+
+(defun agent-shell-org-loops--tag-marker-sent (mk)
+  "Add the sent tag to the heading at marker MK."
+  (when (and (markerp mk) (buffer-live-p (marker-buffer mk)))
+    (with-current-buffer (marker-buffer mk)
+      (save-excursion
+        (goto-char mk)
+        (when (ignore-errors (org-back-to-heading t))
+          (agent-shell-org-loops--add-sent-tag))))))
+
 ;;;; Context assembly
 
 (defun agent-shell-org-loops--ancestor-crumbs ()
@@ -213,19 +250,8 @@ Falls back to the file-level `#+LOOPS_PROJECT:', then `default-directory'."
           (delete-region db (point)))))
     (buffer-string)))
 
-(defun agent-shell-org-loops--subtree-body ()
-  "Return the entire subtree text at point, minus the properties drawer."
-  (save-excursion
-    (org-back-to-heading t)
-    (agent-shell-org-loops--strip-drawer
-     (buffer-substring-no-properties
-      (point)
-      (save-excursion (org-end-of-subtree t t) (point))))))
-
 (defun agent-shell-org-loops--origin-body ()
-  "Return just the origin heading + body before its first child.
-Used for follow-up turns so we don't re-feed the agent its own past
-Reply headings (which include STATE markers)."
+  "Return just the origin heading + body before its first child."
   (save-excursion
     (org-back-to-heading t)
     (let* ((beg (point))
@@ -237,28 +263,60 @@ Reply headings (which include STATE markers)."
       (agent-shell-org-loops--strip-drawer
        (buffer-substring-no-properties beg end)))))
 
-(defun agent-shell-org-loops--build-prompt (first-turn-p)
+(defun agent-shell-org-loops--gather-untagged ()
+  "Return (PARTS . MARKERS): untagged origin body + direct-child subtrees.
+PARTS is a list of body strings ready to concatenate.  MARKERS is a
+list of heading markers (origin plus each included child) that should
+receive the sent tag once the turn completes successfully."
+  (save-excursion
+    (org-back-to-heading t)
+    (let (parts to-tag)
+      (unless (agent-shell-org-loops--heading-sent-p)
+        (push (point-marker) to-tag)
+        (push (agent-shell-org-loops--origin-body) parts))
+      (let ((end (save-excursion (org-end-of-subtree t t) (point))))
+        (when (org-goto-first-child)
+          (while (< (point) end)
+            (unless (agent-shell-org-loops--heading-sent-p)
+              (push (point-marker) to-tag)
+              (let* ((sec-beg (point))
+                     (sec-end (save-excursion
+                                (org-end-of-subtree t t) (point))))
+                (push (agent-shell-org-loops--strip-drawer
+                       (buffer-substring-no-properties sec-beg sec-end))
+                      parts)))
+            (unless (org-goto-sibling) (goto-char end)))))
+      (cons (nreverse parts) (nreverse to-tag)))))
+
+(defun agent-shell-org-loops--build-prompt ()
   "Compose the prompt sent to the agent for the heading at point.
-FIRST-TURN-P adds the system preamble and sends the whole subtree.
-On follow-ups only the origin body-before-first-child goes across, so
-prior Reply children (with their STATE markers) don't poison context."
-  (let* ((tags (org-get-tags nil t))
+Returns (cons PROMPT MARKERS): PROMPT is the string to send; MARKERS is
+the list of heading markers to tag once the turn completes.  The
+preamble is included on the first turn (origin not yet tagged)."
+  (let* ((first-turn-p (not (agent-shell-org-loops--heading-sent-p)))
+         (tags (seq-remove
+                (lambda (tag)
+                  (equal tag agent-shell-org-loops-sent-tag))
+                (org-get-tags nil t)))
          (heading (org-get-heading t t t t))
          (crumbs (agent-shell-org-loops--ancestor-crumbs))
-         (body (if first-turn-p
-                   (agent-shell-org-loops--subtree-body)
-                 (agent-shell-org-loops--origin-body))))
-    (concat
-     (when first-turn-p
-       (concat agent-shell-org-loops-system-preamble "\n\n"))
-     (format "Org file: %s\n" (or (buffer-file-name) (buffer-name)))
-     (format "Heading: %s\n" heading)
-     (when tags
-       (format "Tags: %s\n" (mapconcat #'identity tags " ")))
-     "\n"
-     crumbs
-     (if first-turn-p "Subtree:\n" "Follow-up:\n")
-     body)))
+         (gathered (agent-shell-org-loops--gather-untagged))
+         (parts (car gathered))
+         (markers (cdr gathered))
+         (body (mapconcat #'identity parts "\n")))
+    (cons
+     (concat
+      (when first-turn-p
+        (concat agent-shell-org-loops-system-preamble "\n\n"))
+      (format "Org file: %s\n" (or (buffer-file-name) (buffer-name)))
+      (format "Heading: %s\n" heading)
+      (when tags
+        (format "Tags: %s\n" (mapconcat #'identity tags " ")))
+      "\n"
+      crumbs
+      (if first-turn-p "Subtree:\n" "Follow-up:\n")
+      body)
+     markers)))
 
 ;;;; Placeholder markers in the org buffer
 
@@ -311,7 +369,10 @@ Returns the parent origin heading marker, or nil if placeholder was gone."
           (delete-region reply-start reply-end)
           (goto-char reply-start)
           (insert stars " Reply " ts "\n"
-                  (string-trim response) "\n"))
+                  (string-trim response) "\n")
+          (save-excursion
+            (goto-char reply-start)
+            (agent-shell-org-loops--add-sent-tag)))
         (org-back-to-heading t)
         ;; Return a marker to the ORIGIN heading (parent of this reply).
         (when (org-up-heading-safe)
@@ -442,6 +503,8 @@ otherwise falls back to the per-heading :AGENT_SHELL_BUFFER: property."
                      "(no message body — agent may have only run tools)"
                    (agent-shell-org-loops--markdown-to-org body)))
            (origin-mk (agent-shell-org-loops--replace-placeholder uuid body)))
+      (dolist (mk (plist-get turn :sent-markers))
+        (agent-shell-org-loops--tag-marker-sent mk))
       (cond
        ((null origin-mk)
         (message "agent-shell-org-loops: reply for %s dropped (origin buffer gone)"
@@ -543,30 +606,18 @@ completion."
 cancel it first")
       (let* ((origin-mk (point-marker))
              (uuid (agent-shell-org-loops--uuid))
-             (follow-up-p (agent-shell-org-loops--has-reply-child-p))
-             (prompt (agent-shell-org-loops--build-prompt (not follow-up-p)))
+             (built (agent-shell-org-loops--build-prompt))
+             (prompt (car built))
+             (sent-markers (cdr built))
              (shell (agent-shell-org-loops--get-or-create-shell origin-mk)))
         (org-entry-put (point) "AGENT_PENDING" uuid)
         (agent-shell-org-loops--insert-placeholder uuid)
         (agent-shell-org-loops--enqueue-turn
-         shell (list :uuid uuid :origin origin-mk :accum ""))
+         shell (list :uuid uuid :origin origin-mk :accum ""
+                     :sent-markers sent-markers))
         (agent-shell-org-loops--send-or-queue shell prompt)
         (agent-shell-org-loops--set-todo-silently
          agent-shell-org-loops-inprogress-state)))))
-
-(defun agent-shell-org-loops--has-reply-child-p ()
-  "Return non-nil when the heading at point already has a Reply child."
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((end (save-excursion (org-end-of-subtree t t) (point)))
-          (found nil))
-      (when (org-goto-first-child)
-        (while (and (not found) (< (point) end))
-          (when (string-match-p "\\`Reply\\b"
-                                (or (org-get-heading t t t t) ""))
-            (setq found t))
-          (unless (org-goto-sibling) (goto-char end))))
-      found)))
 
 (defun agent-shell-org-loops--send-or-queue (shell prompt)
   "Send PROMPT to SHELL, or enqueue it if SHELL is busy."
@@ -661,9 +712,11 @@ doesn't collide with the `#+RESULTS:' line the response event handler writes."
     (save-excursion
       (goto-char origin-mk)
       (org-back-to-heading t)
-      (let ((level (org-current-level)))
+      (let ((level (org-current-level))
+            perm-start)
         (org-end-of-subtree t t)
         (unless (bolp) (insert "\n"))
+        (setq perm-start (point))
         (insert (make-string (1+ level) ?*)
                 " Permission request <<agent-shell-permission:" uuid ">>\n"
                 (format "%s\n\n" title)
@@ -671,7 +724,10 @@ doesn't collide with the `#+RESULTS:' line the response event handler writes."
                         uuid)
                 (or (agent-shell-org-loops--tool-call-body tool-call) "")
                 "\n#+end_src\n"
-                "# C-c C-c in the block to allow; \"deny\" to reject.\n")))))
+                "# C-c C-c in the block to allow; \"deny\" to reject.\n")
+        (save-excursion
+          (goto-char perm-start)
+          (agent-shell-org-loops--add-sent-tag))))))
 
 (defun agent-shell-org-loops--tool-call-body (tool-call)
   "Best-effort extraction of a human-readable body for TOOL-CALL."
@@ -816,7 +872,10 @@ that `--on-permission-response' writes."
           (goto-char beg)
           (insert stars " Reply (abandoned — " reason ") "
                   (format-time-string "[%Y-%m-%d %a %H:%M]")
-                  "\n"))))))
+                  "\n")
+          (save-excursion
+            (goto-char beg)
+            (agent-shell-org-loops--add-sent-tag)))))))
 
 (defun agent-shell-org-loops--recover-stranded ()
   "Clear stranded AGENT_PENDING entries whose shell buffer is gone.
