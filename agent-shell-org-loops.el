@@ -444,7 +444,8 @@ otherwise falls back to the per-heading :AGENT_SHELL_BUFFER: property."
                  (config (agent-shell-org-loops--agent-config agent-id))
                  (shell (agent-shell--start :config config
                                             :no-focus t
-                                            :new-session t)))
+                                            :new-session t
+                                            :session-strategy 'new)))
             (agent-shell-org-loops--register-shell shell (current-buffer))
             (if shared-p
                 (setq agent-shell-org-loops--shared-shell shell)
