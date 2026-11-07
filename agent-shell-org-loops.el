@@ -45,7 +45,12 @@
 ;;   :LOOPS_AGENT:         -- per-heading override of the agent config
 ;;   :AGENT_PENDING:       -- uuid of the currently in-flight turn, if any
 ;;
-;; Tag `:noloop:' opts a heading out entirely.
+;;   :BLISS_WORKLOAD:      -- bliss workload running the in-flight turn
+;;
+;; Tag `:noloop:' opts a heading out entirely.  Quick tags configured in
+;; `agent-shell-org-loops-projects', `-approaches' and `-runners' pick the
+;; working directory, the approach and where the turn runs; see
+;; `agent-shell-org-loops-capture-setup' to offer them while capturing.
 
 ;;; Code:
 
@@ -53,6 +58,7 @@
 (require 'org-element)
 (require 'org-capture)
 (require 'ob)
+(require 'ol)
 (require 'cl-lib)
 (require 'subr-x)
 (require 'map)
@@ -66,6 +72,12 @@
 (declare-function shell-maker-busy "shell-maker")
 (declare-function notifications-notify "notifications")
 (declare-function alert "alert")
+;; The bliss runner lives in its own file and loads when first needed.
+(autoload 'agent-shell-org-loops-bliss-trigger "agent-shell-org-loops-bliss")
+(autoload 'agent-shell-org-loops-bliss-cancel "agent-shell-org-loops-bliss")
+(autoload 'agent-shell-org-loops-bliss-resume "agent-shell-org-loops-bliss")
+(autoload 'agent-shell-org-loops-bliss-follow-link "agent-shell-org-loops-bliss")
+(declare-function agent-shell-org-loops-bliss-list-rows "agent-shell-org-loops-bliss")
 (defvar agent-shell-permission-responder-function)
 (defvar agent-shell--state)
 (defvar org-state) ; dynamically bound by `org-after-todo-state-change-hook'
@@ -137,6 +149,41 @@ are performing yourself in this turn."
   "Preamble prepended to the first prompt of every new shell."
   :type 'string)
 
+(defcustom agent-shell-org-loops-projects nil
+  "Projects a heading can name with a quick tag.
+Each entry is (TAG . PLIST).  TAG is an org tag, so it may hold only
+letters, digits and `_@#%'.  PLIST keys:
+  :key       -- character that picks the tag in fast tag selection
+  :directory -- working directory the agent starts in
+  :related   -- list of other directories or packages that are part of
+                this work; the prompt names them to the agent
+A `:LOOPS_PROJECT:' property still wins over the tag."
+  :type '(alist :key-type string :value-type plist))
+
+(defcustom agent-shell-org-loops-approaches nil
+  "Approaches a heading can name with a quick tag.
+Each entry is (TAG . PLIST).  PLIST keys:
+  :key          -- character that picks the tag in fast tag selection
+  :instructions -- text added to the first prompt, describing how the
+                   agent should go about the task
+  :edits        -- non-nil when the approach changes files.  A bliss runner
+                   without :unattended can't approve those changes, so
+                   triggering the pair asks first."
+  :type '(alist :key-type string :value-type plist))
+
+(defcustom agent-shell-org-loops-runners nil
+  "Places a heading can be run, named with a quick tag.
+Each entry is (TAG . PLIST).  PLIST keys:
+  :key        -- character that picks the tag in fast tag selection
+  :bliss      -- a bliss target name.  The task runs as `bliss ai' there
+                 instead of in a local agent-shell, and its output comes
+                 back as the reply when the workload finishes.
+  :agent      -- with :bliss, the bliss agent (claude, pi, ...);
+                 without it, an id from `agent-shell-org-loops-agent-configs'
+  :unattended -- with :bliss, pass `--unattended' (no approval prompts)
+A heading with no runner tag uses a local agent-shell."
+  :type '(alist :key-type string :value-type plist))
+
 ;;;; Internal state
 
 (defvar agent-shell-org-loops--shell-registry (make-hash-table :test 'eq)
@@ -193,16 +240,37 @@ Let-bind while we programmatically drive `org-todo' from callbacks.")
   "Return the list of live buffers with LOOPS enabled."
   (seq-filter #'agent-shell-org-loops--loops-enabled-p (buffer-list)))
 
+(defun agent-shell-org-loops--tagged (alist)
+  "Return the PLIST of the first ALIST entry tagged on the heading at point.
+Inherited tags count."
+  (let ((tags (org-get-tags)))
+    (cdr (seq-find (lambda (entry) (member (car entry) tags)) alist))))
+
+(defun agent-shell-org-loops--quick-tag-p (tag)
+  "Return non-nil when TAG is one of the configured quick tags."
+  (or (assoc tag agent-shell-org-loops-projects)
+      (assoc tag agent-shell-org-loops-approaches)
+      (assoc tag agent-shell-org-loops-runners)))
+
 (defun agent-shell-org-loops--resolve-project ()
   "Return the working directory for the heading at point.
-Falls back to the file-level `#+LOOPS_PROJECT:', then `default-directory'."
+Tries the `:LOOPS_PROJECT:' property, a project tag, the file-level
+`#+LOOPS_PROJECT:', then `default-directory'."
   (or (org-entry-get (point) "LOOPS_PROJECT" t)
+      (plist-get (agent-shell-org-loops--tagged agent-shell-org-loops-projects)
+                 :directory)
       (agent-shell-org-loops--file-keyword "LOOPS_PROJECT")
       default-directory))
+
+(defun agent-shell-org-loops--resolve-runner ()
+  "Return the runner PLIST tagged on the heading at point, or nil."
+  (agent-shell-org-loops--tagged agent-shell-org-loops-runners))
 
 (defun agent-shell-org-loops--resolve-agent ()
   "Return the agent id string used to spawn a shell for the heading at point."
   (or (org-entry-get (point) "LOOPS_AGENT" t)
+      (let ((runner (agent-shell-org-loops--resolve-runner)))
+        (and (not (plist-get runner :bliss)) (plist-get runner :agent)))
       (agent-shell-org-loops--file-keyword "LOOPS_AGENT")
       agent-shell-org-loops-default-agent))
 
@@ -213,6 +281,16 @@ Falls back to the file-level `#+LOOPS_PROJECT:', then `default-directory'."
       (error "Unknown agent id '%s'; see `agent-shell-org-loops-agent-configs'"
              agent-id))
     (funcall ctor)))
+
+(defmacro agent-shell-org-loops--at-origin (mk &rest body)
+  "Run BODY at the heading at marker MK, if its buffer is alive."
+  (declare (indent 1))
+  `(when (and (markerp ,mk) (buffer-live-p (marker-buffer ,mk)))
+     (with-current-buffer (marker-buffer ,mk)
+       (save-excursion
+         (goto-char ,mk)
+         (org-back-to-heading t)
+         ,@body))))
 
 ;;;; Sent-tag bookkeeping
 
@@ -297,27 +375,72 @@ receive the sent tag once the turn completes successfully."
             (unless (org-goto-sibling) (goto-char end)))))
       (cons (nreverse parts) (nreverse to-tag)))))
 
-(defun agent-shell-org-loops--build-prompt ()
+(defun agent-shell-org-loops--whole-subtree ()
+  "Return (PARTS . MARKERS) for the whole subtree at point.
+Used for runners that keep no conversation, so every turn needs it all."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((origin (point-marker))
+          (beg (point))
+          (end (save-excursion (org-end-of-subtree t t) (point)))
+          parts)
+      (with-temp-buffer
+        (insert-buffer-substring (marker-buffer origin) beg end)
+        (goto-char (point-min))
+        (while (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*\n?" nil t)
+          (replace-match ""))
+        (push (buffer-string) parts))
+      ;; Tag the untagged children too, as the stateful path would.
+      (cons parts (cdr (agent-shell-org-loops--gather-untagged))))))
+
+(defun agent-shell-org-loops--project-context ()
+  "Return prompt lines describing the tagged project, or nil."
+  (when-let* ((project (agent-shell-org-loops--tagged
+                       agent-shell-org-loops-projects)))
+    (let ((dir (plist-get project :directory))
+          (related (plist-get project :related)))
+      (concat
+       (when dir (format "Project directory: %s\n" (expand-file-name dir)))
+       (when related
+         (format "Also part of this work: %s\n"
+                 (mapconcat (lambda (r)
+                              (if (string-match-p "/" r) (expand-file-name r) r))
+                            related ", ")))))))
+
+(defun agent-shell-org-loops--build-prompt (&optional stateless preamble)
   "Compose the prompt sent to the agent for the heading at point.
 Returns (cons PROMPT MARKERS): PROMPT is the string to send; MARKERS is
 the list of heading markers to tag once the turn completes.  The
-preamble is included on the first turn (origin not yet tagged)."
-  (let* ((first-turn-p (not (agent-shell-org-loops--heading-sent-p)))
+preamble is included on the first turn (origin not yet tagged).  With
+STATELESS, every turn is treated as the first and carries the whole
+subtree, for runners that remember nothing between turns.  PREAMBLE
+replaces `agent-shell-org-loops-system-preamble'."
+  (let* ((first-turn-p (or stateless
+                           (not (agent-shell-org-loops--heading-sent-p))))
          (tags (seq-remove
                 (lambda (tag)
-                  (equal tag agent-shell-org-loops-sent-tag))
+                  (or (equal tag agent-shell-org-loops-sent-tag)
+                      (agent-shell-org-loops--quick-tag-p tag)))
                 (org-get-tags nil t)))
+         (approach (plist-get (agent-shell-org-loops--tagged
+                               agent-shell-org-loops-approaches)
+                              :instructions))
          (heading (org-get-heading t t t t))
          (crumbs (agent-shell-org-loops--ancestor-crumbs))
-         (gathered (agent-shell-org-loops--gather-untagged))
+         (gathered (if stateless
+                       (agent-shell-org-loops--whole-subtree)
+                     (agent-shell-org-loops--gather-untagged)))
          (parts (car gathered))
          (markers (cdr gathered))
          (body (mapconcat #'identity parts "\n")))
     (cons
      (concat
       (when first-turn-p
-        (concat agent-shell-org-loops-system-preamble "\n\n"))
+        (concat (or preamble agent-shell-org-loops-system-preamble) "\n\n"))
+      (when (and first-turn-p approach)
+        (concat "Approach:\n" (string-trim approach) "\n\n"))
       (format "Org file: %s\n" (or (buffer-file-name) (buffer-name)))
+      (when first-turn-p (agent-shell-org-loops--project-context))
       (format "Heading: %s\n" heading)
       (when tags
         (format "Tags: %s\n" (mapconcat #'identity tags " ")))
@@ -329,8 +452,27 @@ preamble is included on the first turn (origin not yet tagged)."
 
 ;;;; Placeholder markers in the org buffer
 
-(defun agent-shell-org-loops--insert-placeholder (uuid)
+;;;; Links to whatever is doing the work
+
+(defun agent-shell-org-loops--shell-link (shell)
+  "Return an org link to the agent-shell buffer SHELL."
+  (let ((name (if (bufferp shell) (buffer-name shell) shell)))
+    (org-link-make-string (concat "agent-shell:" name) name)))
+
+(defun agent-shell-org-loops--follow-shell-link (name _arg)
+  "Show the agent-shell buffer NAME."
+  (if-let* ((buf (get-buffer name)))
+      (pop-to-buffer buf)
+    (user-error "Shell %s is gone" name)))
+
+(org-link-set-parameters "agent-shell"
+                         :follow #'agent-shell-org-loops--follow-shell-link)
+(org-link-set-parameters "bliss"
+                         :follow #'agent-shell-org-loops-bliss-follow-link)
+
+(defun agent-shell-org-loops--insert-placeholder (uuid &optional link)
   "Insert a pending reply child heading with UUID under the heading at point.
+LINK, an org link to whatever is doing the work, goes in the heading.
 Leaves point unchanged.  Returns a marker to the placeholder start."
   (save-excursion
     (org-back-to-heading t)
@@ -341,7 +483,8 @@ Leaves point unchanged.  Returns a marker to the placeholder start."
       (unless (bolp) (insert "\n"))
       (setq child-start (point-marker))
       (insert (make-string (1+ level) ?*)
-              " Reply <<agent-shell-pending:" uuid ">>\n"
+              " Reply <<agent-shell-pending:" uuid ">>"
+              (if link (concat " " link) "") "\n"
               ":AGENT_TURN:\n"
               ":ID: " uuid "\n"
               ":END:\n"
@@ -362,10 +505,11 @@ Searches every LOOPS buffer; the heading may have been refiled."
             (throw 'found (cons buf (match-beginning 0)))))))
     nil))
 
-(defun agent-shell-org-loops--replace-placeholder (uuid response)
+(defun agent-shell-org-loops--replace-placeholder (uuid response &optional link)
   "Replace the placeholder for UUID with RESPONSE text.
+LINK, if given, stays in the reply heading.
 Returns (cons ORIGIN-MK REPLY-MK) or nil if placeholder was gone."
-  (when-let ((loc (agent-shell-org-loops--find-placeholder uuid)))
+  (when-let* ((loc (agent-shell-org-loops--find-placeholder uuid)))
     (with-current-buffer (car loc)
       (save-excursion
         (goto-char (cdr loc))
@@ -377,7 +521,7 @@ Returns (cons ORIGIN-MK REPLY-MK) or nil if placeholder was gone."
                (ts (format-time-string "[%Y-%m-%d %a %H:%M]")))
           (delete-region reply-start reply-end)
           (goto-char reply-start)
-          (insert stars " Reply " ts "\n"
+          (insert stars " Reply " ts (if link (concat " " link) "") "\n"
                   (string-trim response) "\n")
           (save-excursion
             (goto-char reply-start)
@@ -435,12 +579,29 @@ otherwise falls back to the per-heading :AGENT_SHELL_BUFFER: property."
                            (and bname (get-buffer bname))))))
              (project (agent-shell-org-loops--resolve-project))
              (agent-id (agent-shell-org-loops--resolve-agent)))
+        ;; A shell keeps the directory it started in.  A heading's own shell
+        ;; is replaced when its project has changed since; the shared shell
+        ;; serves the whole file, so it is only warned about.
+        (when (and existing (buffer-live-p existing)
+                   (not (agent-shell-org-loops--same-dir-p existing project)))
+          (if shared-p
+              (display-warning
+               'agent-shell-org-loops
+               (format "Shared shell %s runs in %s, not %s; \
+the project is ignored with #+LOOPS_SHARED_SHELL"
+                       (buffer-name existing)
+                       (buffer-local-value 'default-directory existing)
+                       project))
+            (setq existing nil)))
         (if (and existing (buffer-live-p existing))
             (progn
               (unless shared-p
                 (org-entry-put (point) "AGENT_SHELL_BUFFER" (buffer-name existing)))
               existing)
-          (let* ((default-directory (or project default-directory))
+          ;; A directory without its trailing slash would be read as a file
+          ;; in its parent, so the shell would start one level up.
+          (let* ((default-directory (file-name-as-directory
+                                     (expand-file-name (or project default-directory))))
                  (config (agent-shell-org-loops--agent-config agent-id))
                  (shell (agent-shell--start :config config
                                             :no-focus t
@@ -450,13 +611,31 @@ otherwise falls back to the per-heading :AGENT_SHELL_BUFFER: property."
             (if shared-p
                 (setq agent-shell-org-loops--shared-shell shell)
               (org-entry-put (point) "AGENT_SHELL_BUFFER" (buffer-name shell)))
-            (when-let ((sid (with-current-buffer shell
+            (when-let* ((sid (with-current-buffer shell
                               (ignore-errors
                                 (map-nested-elt agent-shell--state
                                                 '(:session :id))))))
               (unless shared-p
                 (org-entry-put (point) "AGENT_SHELL_SESSION" sid)))
             shell))))))
+
+(declare-function agent-shell-cwd "agent-shell-project")
+
+(defun agent-shell-org-loops--shell-dir (dir)
+  "Return the directory agent-shell would start a shell in for DIR.
+agent-shell moves up to the project root, so compare against that."
+  (let ((default-directory (file-name-as-directory (expand-file-name dir))))
+    (if (fboundp 'agent-shell-cwd)
+        (agent-shell-cwd)
+      default-directory)))
+
+(defun agent-shell-org-loops--same-dir-p (shell dir)
+  "Return non-nil when SHELL already runs where DIR would put a new shell."
+  (let ((have (buffer-local-value 'default-directory shell)))
+    (or (null have)
+        (equal (file-name-as-directory (expand-file-name have))
+               (file-name-as-directory
+                (agent-shell-org-loops--shell-dir dir))))))
 
 (defun agent-shell-org-loops--register-shell (shell-buffer origin-buffer)
   "Install subscriptions and tracking for SHELL-BUFFER owned by ORIGIN-BUFFER."
@@ -552,10 +731,14 @@ first non-empty line is the title and the rest is the body."
 
 (defun agent-shell-org-loops--on-turn-complete (shell-buffer)
   "Handle turn-complete for SHELL-BUFFER: write reply back and update state."
-  (when-let* ((turn (agent-shell-org-loops--pop-turn shell-buffer))
-              (uuid (plist-get turn :uuid)))
-    (let* ((raw (or (plist-get turn :accum) ""))
-           (state-split (agent-shell-org-loops--strip-state-marker raw))
+  (when-let* ((turn (agent-shell-org-loops--pop-turn shell-buffer)))
+    (agent-shell-org-loops--complete-turn turn (or (plist-get turn :accum) ""))))
+
+(defun agent-shell-org-loops--complete-turn (turn raw &optional lenient)
+  "Write the reply RAW for TURN back into org and update the heading's state.
+With LENIENT, a `STATE:' line need not be the very last line."
+  (when-let* ((uuid (plist-get turn :uuid)))
+    (let* ((state-split (agent-shell-org-loops--strip-state-marker raw lenient))
            (parsed-state (car state-split))
            (task-split (agent-shell-org-loops--parse-task-blocks
                         (cdr state-split)))
@@ -570,7 +753,8 @@ first non-empty line is the title and the rest is the body."
                            (if (= 1 (length tasks)) "" "s")))
                   (t
                    "(no message body — agent may have only run tools)")))
-           (markers (agent-shell-org-loops--replace-placeholder uuid body))
+           (markers (agent-shell-org-loops--replace-placeholder
+                     uuid body (plist-get turn :link)))
            (origin-mk (car markers))
            (reply-mk (cdr markers)))
       (dolist (mk (plist-get turn :sent-markers))
@@ -631,15 +815,25 @@ first non-empty line is the title and the rest is the body."
        (t
         (message "agent-shell-org-loops: %s" body))))))
 
-(defun agent-shell-org-loops--strip-state-marker (text)
-  "Return (STATE . BODY): STATE from a trailing `STATE: X' line, or nil."
+(defun agent-shell-org-loops--strip-state-marker (text &optional lenient)
+  "Return (STATE . BODY): STATE from a trailing `STATE: X' line, or nil.
+With LENIENT, take the last `STATE: X' line anywhere and drop what follows
+it, for output that may end with terminal noise."
   (let ((trimmed (string-trim-right (or text ""))))
-    (if (string-match "\\(?:\\`\\|\n\\)STATE:[ \t]*\\([A-Z]+\\)[ \t]*\\'"
-                      trimmed)
-        (let ((state (match-string 1 trimmed))
-              (body (substring trimmed 0 (match-beginning 0))))
-          (cons (upcase state) (string-trim-right body)))
-      (cons nil trimmed))))
+    (cond
+     ((string-match "\\(?:\\`\\|\n\\)STATE:[ \t]*\\([A-Z]+\\)[ \t]*\\'"
+                    trimmed)
+      (let ((state (match-string 1 trimmed))
+            (body (substring trimmed 0 (match-beginning 0))))
+        (cons (upcase state) (string-trim-right body))))
+     ((and lenient
+           (let ((pos nil) (start 0))
+             (while (string-match "^STATE:[ \t]*\\([A-Z]+\\)[ \t]*$" trimmed start)
+               (setq pos (match-beginning 0) start (match-end 0)))
+             (and pos (string-match "^STATE:[ \t]*\\([A-Z]+\\)[ \t]*$" trimmed pos))))
+      (cons (upcase (match-string 1 trimmed))
+            (string-trim-right (substring trimmed 0 (match-beginning 0)))))
+     (t (cons nil trimmed)))))
 
 (defvar org-inhibit-logging)
 
@@ -672,24 +866,30 @@ queued via `agent-shell--prompt-queue-enqueue' and auto-drains at turn
 completion."
   (save-excursion
     (org-back-to-heading t)
-    (if (org-entry-get (point) "AGENT_PENDING")
-        (message
-         "agent-shell-org-loops: heading already has an in-flight turn; \
-cancel it first")
+    (cond
+     ((org-entry-get (point) "AGENT_PENDING")
+      (message
+       "agent-shell-org-loops: heading already has an in-flight turn; \
+cancel it first"))
+     ((plist-get (agent-shell-org-loops--resolve-runner) :bliss)
+      (agent-shell-org-loops-bliss-trigger
+       (agent-shell-org-loops--resolve-runner)))
+     (t
       (let* ((origin-mk (point-marker))
              (uuid (agent-shell-org-loops--uuid))
              (built (agent-shell-org-loops--build-prompt))
              (prompt (car built))
              (sent-markers (cdr built))
-             (shell (agent-shell-org-loops--get-or-create-shell origin-mk)))
+             (shell (agent-shell-org-loops--get-or-create-shell origin-mk))
+             (link (agent-shell-org-loops--shell-link shell)))
         (org-entry-put (point) "AGENT_PENDING" uuid)
-        (agent-shell-org-loops--insert-placeholder uuid)
+        (agent-shell-org-loops--insert-placeholder uuid link)
         (agent-shell-org-loops--enqueue-turn
-         shell (list :uuid uuid :origin origin-mk :accum ""
+         shell (list :uuid uuid :origin origin-mk :accum "" :link link
                      :sent-markers sent-markers))
         (agent-shell-org-loops--send-or-queue shell prompt)
         (agent-shell-org-loops--set-todo-silently
-         agent-shell-org-loops-inprogress-state)))))
+         agent-shell-org-loops-inprogress-state))))))
 
 (defun agent-shell-org-loops--send-or-queue (shell prompt)
   "Send PROMPT to SHELL, or enqueue it if SHELL is busy."
@@ -709,6 +909,9 @@ than `turn-complete', so our own queue would otherwise drift."
          (shell (or (and bname (get-buffer bname))
                     agent-shell-org-loops--shared-shell))
          (uuid (org-entry-get (point) "AGENT_PENDING")))
+    (when (org-entry-get (point) "BLISS_WORKLOAD")
+      (when uuid (agent-shell-org-loops-bliss-cancel uuid))
+      (setq shell nil))
     (when (and shell (buffer-live-p shell))
       (with-current-buffer shell
         (ignore-errors (agent-shell-interrupt t)))
@@ -720,7 +923,7 @@ than `turn-complete', so our own queue would otherwise drift."
 
 (defun agent-shell-org-loops--remove-turn-from-queue (shell uuid)
   "Drop the turn identified by UUID from SHELL's pending queue."
-  (when-let ((pl (agent-shell-org-loops--tracking shell)))
+  (when-let* ((pl (agent-shell-org-loops--tracking shell)))
     (agent-shell-org-loops--update-tracking
      shell :pending-queue
      (seq-remove (lambda (turn) (equal (plist-get turn :uuid) uuid))
@@ -742,6 +945,39 @@ than `turn-complete', so our own queue would otherwise drift."
               (when (equal (org-get-todo-state)
                            agent-shell-org-loops-trigger-state)
                 (agent-shell-org-loops--trigger-heading)))))))))
+
+(defun agent-shell-org-loops--quick-tag-alist ()
+  "Return a tag alist for fast selection, one exclusive group per kind.
+Only one project, one approach and one runner can be picked."
+  (let (out)
+    (dolist (group (list agent-shell-org-loops-projects
+                         agent-shell-org-loops-approaches
+                         agent-shell-org-loops-runners))
+      (when group
+        (setq out (append out
+                          '((:startgroup))
+                          (mapcar (lambda (entry)
+                                    (if-let* ((key (plist-get (cdr entry) :key)))
+                                        (cons (car entry) key)
+                                      (list (car entry))))
+                                  group)
+                          '((:endgroup) (:newline))))))
+    out))
+
+;;;###autoload
+(defun agent-shell-org-loops-capture-setup ()
+  "Offer the quick tags with \\[org-set-tags-command] in this capture buffer.
+Use it as the `:hook' of a capture template that lands a READY heading.
+The tags come from `agent-shell-org-loops-projects',
+`agent-shell-org-loops-approaches' and `agent-shell-org-loops-runners'."
+  (when-let* ((alist (agent-shell-org-loops--quick-tag-alist)))
+    (setq-local org-current-tag-alist alist)
+    (setq-local org-use-fast-tag-selection t)
+    (setq-local org-fast-tag-selection-single-key nil)
+    (setq-local header-line-format
+                (list header-line-format
+                      (substitute-command-keys
+                       "  quick tags \\[org-set-tags-command]")))))
 
 ;;;; Permission plumbing
 
@@ -825,7 +1061,7 @@ doesn't collide with the `#+RESULTS:' line the response event handler writes."
 
 (defun agent-shell-org-loops--find-permission-by-request-id (shell request-id)
   "Return (UUID . RECORD) for REQUEST-ID in SHELL's tracking, or nil."
-  (when-let ((tracking (agent-shell-org-loops--tracking shell)))
+  (when-let* ((tracking (agent-shell-org-loops--tracking shell)))
     (catch 'found
       (maphash
        (lambda (uuid rec)
@@ -932,7 +1168,7 @@ that `--on-permission-response' writes."
 
 (defun agent-shell-org-loops--abandon-placeholder (uuid reason)
   "Rewrite the placeholder for UUID to a REASON marker."
-  (when-let ((loc (agent-shell-org-loops--find-placeholder uuid)))
+  (when-let* ((loc (agent-shell-org-loops--find-placeholder uuid)))
     (with-current-buffer (car loc)
       (save-excursion
         (goto-char (cdr loc))
@@ -958,11 +1194,16 @@ open — so a crash mid-turn doesn't leave the file wedged."
     (goto-char (point-min))
     (org-map-entries
      (lambda ()
-       (when-let* ((uuid (org-entry-get (point) "AGENT_PENDING"))
-                   (bname (org-entry-get (point) "AGENT_SHELL_BUFFER"))
-                   ((not (get-buffer bname))))
-         (agent-shell-org-loops--abandon-placeholder uuid "shell died")
-         (org-entry-delete (point) "AGENT_PENDING"))))))
+       (when-let* ((uuid (org-entry-get (point) "AGENT_PENDING")))
+         (let ((bname (org-entry-get (point) "AGENT_SHELL_BUFFER"))
+               (workload (org-entry-get (point) "BLISS_WORKLOAD")))
+           (cond
+            ;; A bliss workload outlives Emacs, so watch it again.
+            (workload
+             (agent-shell-org-loops-bliss-resume uuid workload))
+            ((and bname (not (get-buffer bname)))
+             (agent-shell-org-loops--abandon-placeholder uuid "shell died")
+             (org-entry-delete (point) "AGENT_PENDING")))))))))
 
 ;;;; Batch trigger
 
@@ -1077,7 +1318,9 @@ open — so a crash mid-turn doesn't leave the file wedged."
                rows)))
           (plist-get pl :permissions))))
      agent-shell-org-loops--shell-registry)
-    (nreverse rows)))
+    (append (nreverse rows)
+            (when (featurep 'agent-shell-org-loops-bliss)
+              (agent-shell-org-loops-bliss-list-rows)))))
 
 ;;;###autoload
 (defun agent-shell-org-loops-list ()

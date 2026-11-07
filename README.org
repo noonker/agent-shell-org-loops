@@ -204,6 +204,56 @@ Put these in the heading's own property drawer:
 - =:LOOPS_PROJECT:= — override the working directory for this heading only
 - =:LOOPS_AGENT:= — override the agent config for this heading only
 
+* Links to the work
+
+The placeholder and the finished =Reply= heading carry a link to whatever
+is doing the work: =[[agent-shell:*Claude* <proj>]]= opens the shell
+buffer, and =[[bliss:sunny-otter]]= attaches to the bliss workload (or
+shows its logs once it has finished).  Follow them with =C-c C-o= or a click.
+
+* Quick tags
+
+Three kinds of tag can steer a heading.  Define them ahead of time; a
+heading takes at most one of each.
+
+#+begin_src emacs-lisp
+(setq agent-shell-org-loops-projects
+      '(("dotfiles" :key ?d :directory "~/git/dotfiles"
+         :related ("~/git/guix" "emacs-bliss"))))
+
+(setq agent-shell-org-loops-approaches
+      '(("research" :key ?r :instructions "Investigate and report. Change nothing.")
+        ("fix"      :key ?f :instructions "Make the fix and run the tests.")))
+
+(setq agent-shell-org-loops-runners
+      '(("local" :key ?l)                                  ; agent-shell here
+        ("pod"   :key ?P :bliss "local" :unattended t)))   ; bliss ai on a target
+#+end_src
+
+- *Project*: the agent starts in =:directory=, and the first prompt names it
+  and the =:related= directories or packages.  =:LOOPS_PROJECT:= still wins.
+- *Approach*: =:instructions= go at the top of the first prompt.
+- *Runner*: with =:bliss TARGET= the heading runs as =bliss ai= there,
+  from the project directory.  Its output becomes the reply once the
+  workload finishes (checked every =agent-shell-org-loops-bliss-poll-interval=
+  seconds, and picked up again if Emacs restarts).  bliss remembers nothing
+  between runs, so each =READY= sends the whole subtree.  Permission prompts
+  don't reach org, so a task that edits files usually needs =:unattended t=.
+  Flipping the heading to =CANCELLED= runs =bliss stop=.  A runner without
+  =:bliss= uses agent-shell here, with =:agent= picking the agent config.
+  The runner is in =agent-shell-org-loops-bliss.el=, which loads the first
+  time it's needed.  It reads bliss's =--json= output (=ai --json=,
+  =status --json=), so it needs a bliss recent enough to have that.
+
+The tags are ordinary org tags (letters, digits and =_@#%= only).  To offer
+them in a capture buffer, add the setup function as the template's =:hook=;
+=C-c C-q= then shows one group per kind:
+
+#+begin_src emacs-lisp
+("i" "Immediate" entry (file+headline "~/org/today.org" "Tasks")
+ "** READY %?" :hook agent-shell-org-loops-capture-setup)
+#+end_src
+
 * Capture
 
 Org-capture templates that land a =READY= heading in a LOOPS-enabled file
